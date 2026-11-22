@@ -1,18 +1,21 @@
 import json
 import os
-import re
 import subprocess
 import textwrap
 from pathlib import Path
 
-import anthropic
+import numpy as np
 from faster_whisper import WhisperModel
 
 SRC = os.environ["VIDEO_URL"]  # link ya repo ke andar ki file ka path
 NUM_CLIPS = int(os.environ.get("NUM_CLIPS", "5"))
-MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
+MIN_LEN, MAX_LEN = 25, 55  # clip length seconds
 OUT = Path("output")
 OUT.mkdir(exist_ok=True)
+
+KEYWORDS = ["wow", "crazy", "no way", "oh my god", "omg", "insane", "unbelievable",
+            "bro", "what", "never", "secret", "best", "worst", "shocked", "scared",
+            "love", "hate", "money", "wait", "stop", "mistake", "truth"]
 
 
 def run(cmd):
@@ -31,27 +34,54 @@ else:
 # 2) Transcribe (Whisper, free, CPU)
 print("Transcribing...")
 model = WhisperModel("small", device="cpu", compute_type="int8")
-segments, _ = model.transcribe(video, word_timestamps=True)
-segments = list(segments)
-words = [w for s in segments for w in (s.words or [])]
-transcript = "\n".join(f"[{s.start:.1f}] {s.text.strip()}" for s in segments)
+segs, _ = model.transcribe(video, word_timestamps=True)
+segs = list(segs)
+words = [w for s in segs for w in (s.words or [])]
 
-# 3) Claude se best moments + hooks
-print("Picking moments...")
-client = anthropic.Anthropic()
-prompt = f"""Below is a timestamped transcript of a long video.
-Pick the {NUM_CLIPS} most engaging, self-contained moments for short-form clips (20-60 seconds each, no overlap).
-For each give a scroll-stopping hook (max 8 words) shown at the start of the clip.
-Reply with ONLY a JSON array: [{{"start": seconds, "end": seconds, "hook": "text"}}]
+# 3) Audio loudness har second ke liye
+print("Analysing audio...")
+raw = subprocess.run(
+    ["ffmpeg", "-v", "error", "-i", video, "-ac", "1", "-ar", "8000", "-f", "s16le", "-"],
+    capture_output=True, check=True).stdout
+audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+n_sec = len(audio) // 8000
+rms = np.array([np.sqrt(np.mean(audio[i * 8000:(i + 1) * 8000] ** 2)) for i in range(n_sec)])
+rms = rms / (rms.max() + 1e-9)
 
-Transcript:
-{transcript[:150000]}"""
-resp = client.messages.create(
-    model=MODEL, max_tokens=2000,
-    messages=[{"role": "user", "content": prompt}],
-)
-text = resp.content[0].text
-clips = json.loads(re.search(r"\[.*\]", text, re.S).group(0))
+# 4) Candidate windows ko score do
+cands = []
+for i, s in enumerate(segs):
+    start = s.start
+    end = None
+    text = ""
+    for t in segs[i:]:
+        text += " " + t.text
+        if t.end - start >= MIN_LEN:
+            end = t.end
+            break
+    if end is None or end - start > MAX_LEN or end > n_sec:
+        continue
+    loud = float(rms[int(start):int(end)].mean())
+    n_words = len(text.split())
+    speed = min(n_words / (end - start) / 4.0, 1.0)  # ~4 words/sec = fast
+    low = text.lower()
+    excite = min(low.count("!") * 0.1 + low.count("?") * 0.05
+                 + sum(low.count(k) for k in KEYWORDS) * 0.1, 1.0)
+    score = loud + 0.7 * speed + 1.0 * excite
+    cands.append({"start": start, "end": end, "score": score, "text": text.strip()})
+
+cands.sort(key=lambda c: c["score"], reverse=True)
+clips = []
+for c in cands:
+    if all(c["end"] <= k["start"] or c["start"] >= k["end"] for k in clips):
+        clips.append(c)
+    if len(clips) == NUM_CLIPS:
+        break
+
+for c in clips:
+    first = c["text"].replace("\n", " ").split(".")[0].split("?")[0].split("!")[0]
+    c["hook"] = " ".join(first.split()[:8]) + "..."
+
 (OUT / "clips.json").write_text(json.dumps(clips, indent=2, ensure_ascii=False))
 
 
@@ -61,10 +91,12 @@ def ts(t):
     return f"{h:02d}:{m:02d}:{int(s):02d},{int((s % 1) * 1000):03d}"
 
 
-# 4) Har clip: captions + crop + hook
+# 5) Har clip: captions + 9:16 crop + hook
 for i, c in enumerate(clips, 1):
     start, end = float(c["start"]), float(c["end"])
     ws = [w for w in words if w.start >= start and w.end <= end]
+    if not ws:
+        continue
     lines = []
     for k in range(0, len(ws), 3):
         chunk = ws[k:k + 3]
