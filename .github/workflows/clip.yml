@@ -29,7 +29,6 @@ jobs:
 
       - name: Run clipper
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           VIDEO_URL: ${{ github.event.inputs.video_url }}
           NUM_CLIPS: ${{ github.event.inputs.num_clips }}
         run: python clipper.py
